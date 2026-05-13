@@ -10,10 +10,7 @@ from openai import OpenAI
 # ==========================================
 st.set_page_config(page_title="NL2SQL Agent Demo", page_icon="🔍", layout="wide")
 
-client = OpenAI(
-    api_key="sk-459ed873d35842abbaa87dd1b1d5c15b",
-    base_url="https://api.deepseek.com"
-)
+client = 
 
 DB_BASE_DIR = "data/database"
 
