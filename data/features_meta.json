@@ -1,0 +1,6 @@
+{
+  "embedder": "tfidf",
+  "n_rows": 1022,
+  "n_features": 47,
+  "positive_rate": 0.2671232876712329
+}
