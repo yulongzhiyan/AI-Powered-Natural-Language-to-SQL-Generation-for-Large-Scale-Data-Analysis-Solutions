@@ -1,118 +1,141 @@
-import sqlite3
+"""
+Interactive entry point: RAG + self-correction + Bayesian risk gate
+
+This file keeps the original demo behaviour (single SQLite file, console
+loop) and adds the new decision layer as an *optional* stage.  The legacy
+code path is preserved verbatim because the thesis baseline has to stay
+reproducible -- set ``NL2SQL_RISK_LAYER=off`` (or pass ``--legacy``) to run
+exactly the original pipeline.
+
+New stage in the pipeline
+-------------------------
+    retrieve schema -> generate SQL -> sandbox execution
+      -> (success) risk model P(wrong|x) -> Bayesian decision
+           EXECUTE : return the result
+           RETRY   : K-sample consistency check, then decide again
+           CLARIFY : ask the user to disambiguate instead of guessing
+"""
+
+from __future__ import annotations
+
+import argparse
 import os
+import sys
+
 import chromadb
-from openai import OpenAI
 
-# 1. Configuration
-# REMEMBER TO PASTE YOUR REAL API KEY HERE
-os.environ["DEEPSEEK_API_KEY"] = "sk-307594d3f334466d94ec9088e76d5f96"
-client = OpenAI(
-    api_key=os.environ.get("DEEPSEEK_API_KEY"),
-    base_url="https://api.deepseek.com"
-)
+from config import (DATABASE_DIR, DEEPSEEK_API_KEY, MAX_REFLECTION_RETRIES,
+                    MODEL_DIR, TEMPERATURE_GREEDY)
+from sql_sandbox import execute_sql, results_match
 
-# 2. Initialize ChromaDB Vector Store
+# --------------------------------------------------------------------------
+# Legacy configuration (kept for backward compatibility)
+# --------------------------------------------------------------------------
+os.environ.setdefault("DEEPSEEK_API_KEY", DEEPSEEK_API_KEY)
+
 chroma_client = chromadb.PersistentClient(path="./chroma_db")
 collection = chroma_client.get_or_create_collection(name="schema_collection")
 
+
 def retrieve_relevant_schema(query, top_k=2):
-    """Retrieve the most relevant table schemas using RAG."""
+    """Retrieve the most relevant table schemas using RAG (legacy helper)."""
     results = collection.query(query_texts=[query], n_results=top_k)
-    retrieved_ddls = "\n".join(results['documents'][0])
-    return retrieved_ddls
+    return "\n".join(results["documents"][0])
+
 
 def execute_sql_in_sandbox(db_path, sql_query):
-    """
-    Attempt to execute the generated SQL in the SQLite database.
-    Returns (True, result_data) if successful.
-    Returns (False, error_message) if it fails.
-    """
-    try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        cursor.execute(sql_query)
-        results = cursor.fetchall()
-        conn.close()
-        return True, results
-    except Exception as e:
-        return False, str(e)
+    """Legacy wrapper kept so external callers do not break."""
+    return execute_sql(db_path, sql_query)
 
-def generate_and_correct_sql(query, db_path, max_retries=3):
-    """
-    Core Agent Loop: Generate SQL -> Execute -> Catch Error -> Reflect & Correct
-    """
+
+# --------------------------------------------------------------------------
+# Legacy pipeline (unchanged semantics)
+# --------------------------------------------------------------------------
+def generate_and_correct_sql(query, db_path, max_retries=MAX_REFLECTION_RETRIES):
+    """Generate SQL -> execute -> reflect on the error log -> retry."""
+    from llm_client import DeepSeekClient
+
+    client = DeepSeekClient()
     retrieved_schema = retrieve_relevant_schema(query)
-
-    # Initial Prompt
-    prompt = f"""
-    You are a senior database architect. Convert the user's natural language question into a valid SQL query.
-    
-    [Relevant Database Schema]:
-    {retrieved_schema}
-    
-    [User Question]:
-    {query}
-    
-    Output ONLY the raw SQL query. No markdown tags, no explanations.
-    """
-
-    messages = [
-        {"role": "system", "content": "You are a highly accurate Text-to-SQL assistant."},
-        {"role": "user", "content": prompt}
-    ]
+    sql, _ = client.generate_sql(query, retrieved_schema, TEMPERATURE_GREEDY)
 
     for attempt in range(1, max_retries + 1):
-        print(f"\n--- [Attempt {attempt}/{max_retries}] Generating SQL... ---")
+        print(f"\n--- [Attempt {attempt}/{max_retries}] ---")
+        print(f"[Generated SQL]: {sql}")
+        ok, out = execute_sql(db_path, sql)
+        if ok:
+            print("[Success]: SQL executed without errors.")
+            return sql, out
+        print(f"[Error Caught]: {out}")
+        if attempt < max_retries:
+            print("[Self-Correction]: sending the error log back to the LLM...")
+            sql, _ = client.repair_sql(query, retrieved_schema, sql, str(out),
+                                       TEMPERATURE_GREEDY)
+    print("[Failed]: maximum retries reached.")
+    return None, out
 
-        # 1. Generate SQL
-        response = client.chat.completions.create(
-            model="deepseek-chat",
-            messages=messages,
-            temperature=0.1
-        )
-        generated_sql = response.choices[0].message.content.strip()
 
-        # Clean up potential markdown formatting from LLM
-        generated_sql = generated_sql.replace("```sql", "").replace("```", "").strip()
-        print(f"[Generated SQL]: {generated_sql}")
+# --------------------------------------------------------------------------
+# New pipeline: the same loop plus the risk gate
+# --------------------------------------------------------------------------
+def build_agent(db_id: str | None = None, model_key: str = "LR"):
+    """Load the risk stack; return ``None`` when the models are absent."""
+    if not os.path.isfile(os.path.join(MODEL_DIR, "lr_risk_model.joblib")):
+        print("[risk layer] no model in ./models - run error_classifier.py first.")
+        return None
+    from bayesian_agent import BayesianNL2SQLAgent
+    from error_classifier import SQLErrorClassifier
+    from llm_client import DeepSeekClient
 
-        # 2. Execute in Sandbox
-        print("[Sandbox Action]: Executing SQL in database...")
-        success, execution_result = execute_sql_in_sandbox(db_path, generated_sql)
+    models = SQLErrorClassifier.load(MODEL_DIR)
+    return BayesianNL2SQLAgent(client=DeepSeekClient(), classifier=models,
+                               model_key=model_key)
 
-        # 3. Check Result and Reflect
-        if success:
-            print("[Success]: SQL executed perfectly without syntax errors!")
-            return generated_sql, execution_result
-        else:
-            error_msg = execution_result
-            print(f"[Error Caught]: {error_msg}")
 
-            if attempt < max_retries:
-                print("[Self-Correction Action]: Sending error log back to LLM for reflection...")
-                # Append the failed attempt and the database error to the message history
-                messages.append({"role": "assistant", "content": generated_sql})
-                reflection_prompt = f"Executing the above SQL resulted in this database error: '{error_msg}'. Please analyze the error and provide a corrected SQL query. Output ONLY the raw SQL."
-                messages.append({"role": "user", "content": reflection_prompt})
-            else:
-                print("[Failed]: Maximum retries reached. Unable to generate correct SQL.")
-                return None, error_msg
+def answer(query: str, db_path: str, db_id: str | None = None,
+           model_key: str = "LR", legacy: bool = False):
+    db_id = db_id or os.path.splitext(os.path.basename(db_path))[0]
+    agent = None if legacy else build_agent(db_id, model_key)
+    if agent is None:
+        sql, data = generate_and_correct_sql(query, db_path)
+        return {"status": "answered" if sql else "exec_failed", "sql": sql,
+                "data": data, "p_wrong": None, "action_path": ["legacy"]}
 
-# ================= Test Execution Area =================
-if __name__ == "__main__":
-    db_file_path = "data/school.sqlite"
+    result = agent.run(query, db_id, db_path)
+    return {"status": result.status, "sql": result.final_sql,
+            "data": None, "p_wrong": result.p_wrong_final,
+            "action_path": result.action_path, "calls": result.n_calls,
+            "latency_s": result.latency_s}
 
-    print("Welcome to the NL2SQL Agent (RAG + Self-Correction)")
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="NL2SQL agent (RAG + risk gate)")
+    ap.add_argument("--db", default=os.path.join(DATABASE_DIR, "school.sqlite"))
+    ap.add_argument("--model", default="LR", choices=["LR", "RF"])
+    ap.add_argument("--legacy", action="store_true",
+                    help="disable the risk layer (original behaviour)")
+    args = ap.parse_args()
+
+    legacy = args.legacy or os.environ.get("NL2SQL_RISK_LAYER", "on").lower() == "off"
+    print("NL2SQL agent - RAG + self-correction"
+          + ("" if legacy else " + Bayesian risk gate"))
     while True:
-        user_query = input("\nUser Query: ")
-        if user_query.lower() in ['exit', 'quit']:
+        try:
+            query = input("\nUser Query: ")
+        except (EOFError, KeyboardInterrupt):
+            break
+        if query.lower() in {"exit", "quit"}:
             break
 
-        final_sql, data = generate_and_correct_sql(user_query, db_file_path)
+        out = answer(query, args.db, model_key=args.model, legacy=legacy)
+        print("\n" + "=" * 56)
+        print(f"status   : {out['status']}")
+        print(f"trace    : {' -> '.join(out['action_path'])}")
+        if out["p_wrong"] is not None:
+            print(f"P(wrong) : {out['p_wrong']:.3f}")
+        print(f"SQL      : {out['sql']}")
+        print("=" * 56)
 
-        if final_sql:
-            print("\n" + "="*50)
-            print("🎉 [Final Approved SQL]:")
-            print(final_sql)
-            print(f"📊 [Sample Data Retrieved]: {data[:3]} ...")
-            print("="*50 + "\n")
+
+if __name__ == "__main__":
+    main()

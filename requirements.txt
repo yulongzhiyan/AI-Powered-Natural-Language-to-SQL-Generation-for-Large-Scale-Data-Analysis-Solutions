@@ -1,0 +1,17 @@
+# Core pipeline (verified on Python 3.9 / Windows)
+numpy==1.26.4
+pandas==2.0.3
+scipy==1.11.4
+scikit-learn==1.3.2
+matplotlib==3.7.5
+joblib==1.5.3
+
+# LLM access
+keys
+
+# Vector store used by the original retrieval path (optional: the new
+# feature extractor falls back to TF-IDF when chromadb is unavailable)
+chromadb==0.5.23
+
+# Web demo (optional, only for the Streamlit interface)
+streamlit>=1.30

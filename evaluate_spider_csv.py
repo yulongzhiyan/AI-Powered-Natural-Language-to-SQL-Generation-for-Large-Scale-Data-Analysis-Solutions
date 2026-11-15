@@ -6,8 +6,13 @@ from openai import OpenAI
 import chromadb
 
 # ================= 1. Configuration =================
-# REMEMBER TO PASTE YOUR REAL API KEY HERE
-os.environ["DEEPSEEK_API_KEY"] = "sk-307594d3f334466d94ec9088e76d5f96"
+# The key must come from the environment, never from the source file.
+if not os.environ.get("DEEPSEEK_API_KEY"):
+    raise SystemExit(
+        "DEEPSEEK_API_KEY is not set. Export it first, e.g.\n"
+        "    set DEEPSEEK_API_KEY=sk-...      (Windows cmd)\n"
+        "    export DEEPSEEK_API_KEY=sk-...   (bash)"
+    )
 client = OpenAI(
     api_key=os.environ.get("DEEPSEEK_API_KEY"),
     base_url="https://api.deepseek.com"

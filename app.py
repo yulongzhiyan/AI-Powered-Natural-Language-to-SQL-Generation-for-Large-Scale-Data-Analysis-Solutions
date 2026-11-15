@@ -10,7 +10,16 @@ from openai import OpenAI
 # ==========================================
 st.set_page_config(page_title="NL2SQL Agent Demo", page_icon="🔍", layout="wide")
 
-client = 
+# The key is read from the environment (or a local .env file); never hard-code it.
+_api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+if not _api_key:
+    st.error("DEEPSEEK_API_KEY is not set. Export it in your shell, then restart the app.")
+    st.stop()
+
+client = OpenAI(
+    api_key=_api_key,
+    base_url="https://api.deepseek.com"
+)
 
 DB_BASE_DIR = "data/database"
 
@@ -94,6 +103,58 @@ def generate_and_correct(query, db_path, db_id, max_retries=3):
 
     return None, None, f"Failed after {max_retries} retries. Last error: {last_error}"
 
+
+# ==========================================
+# 3b. Risk-gated agent (new layer)
+# ==========================================
+@st.cache_resource
+def load_risk_agent():
+    """Load the Bayesian decision stack once per session.
+
+    Returns ``None`` when the trained models are missing, in which case the
+    page falls back to the original loop and says so.
+    """
+    from config import MODEL_DIR
+    model_file = os.path.join(MODEL_DIR, "lr_risk_model.joblib")
+    if not os.path.isfile(model_file):
+        return None
+    try:
+        from bayesian_agent import BayesianNL2SQLAgent
+        from error_classifier import SQLErrorClassifier
+        from llm_client import DeepSeekClient
+
+        models = SQLErrorClassifier.load(MODEL_DIR)
+        return BayesianNL2SQLAgent(client=DeepSeekClient(), classifier=models,
+                                   model_key="LR")
+    except Exception as exc:          # missing key, broken model, ...
+        st.sidebar.warning(f"Risk layer disabled: {type(exc).__name__}")
+        return None
+
+
+def analyse_query(query, db_path, db_id):
+    """Run the risk-gated agent; return a uniform dict for the UI."""
+    agent = load_risk_agent()
+    if agent is None:
+        sql, df, status = generate_and_correct(query, db_path, db_id)
+        return {"status": status, "sql": sql, "data": df, "p_wrong": None,
+                "trace": "legacy loop", "calls": None}
+
+    res = agent.run(query, db_id, db_path)
+    ok, data = (False, None)
+    if res.status == "answered" and res.final_sql:
+        ok, data = execute_sql_for_dataframe(db_path, res.final_sql)
+    return {
+        "status": ("Success" if ok else ("Clarification required"
+                                         if res.status == "clarify"
+                                         else "Execution failed")),
+        "sql": res.final_sql,
+        "data": data if ok else None,
+        "p_wrong": res.p_wrong_final,
+        "trace": " -> ".join(res.action_path),
+        "calls": res.n_calls,
+        "error": res.error,
+    }
+
 # ==========================================
 # 4. Streamlit UI Layout
 # ==========================================
@@ -125,25 +186,43 @@ if selected_db:
             st.warning("Please enter a question first.")
         else:
             with st.spinner(f"Agent is reasoning over '{selected_db}' database..."):
-                sql, result_data, status = generate_and_correct(user_query, current_db_path, selected_db)
-
+                out = analyse_query(user_query, current_db_path, selected_db)
                 st.divider()
 
-                if "Success" in status:
-                    st.success(f"Agent Status: {status}")
+                # --- decision trace (the risk layer's explainability) -----
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Risk P(wrong)",
+                          "n/a" if out["p_wrong"] is None
+                          else f"{out['p_wrong']:.2f}")
+                c2.metric("LLM calls",
+                          "-" if out["calls"] is None else out["calls"])
+                c3.metric("Decision", out["trace"].split(" -> ")[-1][:24])
+
+                if out["status"] == "Clarification required":
+                    st.warning(
+                        "The risk model considers this question too ambiguous to "
+                        "answer safely. Please add a filter, a time range or the "
+                        "metric you mean.")
+                    with st.expander("👁️ Decision trace"):
+                        st.code(out["trace"], language="text")
+
+                elif out["status"].startswith("Success"):
+                    st.success(f"Agent Status: {out['status']}")
 
                     col1, col2 = st.columns(2)
                     with col1:
                         st.subheader("💻 Final Generated SQL")
-                        st.code(sql, language="sql")
+                        st.code(out["sql"], language="sql")
+                        with st.expander("👁️ Decision trace"):
+                            st.code(out["trace"], language="text")
 
                     with col2:
                         st.subheader("📊 Execution Result")
-                        if isinstance(result_data, pd.DataFrame):
-                            if result_data.empty:
+                        if isinstance(out["data"], pd.DataFrame):
+                            if out["data"].empty:
                                 st.warning("Query executed successfully, but returned 0 rows.")
                             else:
-                                st.dataframe(result_data, use_container_width=True)
+                                st.dataframe(out["data"], use_container_width=True)
                 else:
                     st.error("Agent failed to generate a valid SQL query.")
-                    st.code(status, language="bash")
+                    st.code(out.get("error") or out["status"], language="bash")

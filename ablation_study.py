@@ -1,154 +1,198 @@
-import json
-import sqlite3
-import os
+"""
+Ablation study over the six configurations
+
+    LLM_ONLY   zero-shot, whole DDL in the prompt, one attempt
+    LLM_RAG    + vector schema retrieval, one attempt (the paper's baseline 2)
+    FIXED_3    + error-log driven self-correction, ceiling of 3 attempts
+    BAYES_LR   + risk gate with the logistic-regression model
+    BAYES_RF   + risk gate with the random-forest model
+    BAYES_FULL + risk gate with the multi-sample consistency budget (K=5)
+
+``FIXED_3`` is the original full system ; ``BAYES_*`` insert the
+decision layer between generation and execution.
+
+Each configuration appends one row per query to
+``ablation_results_<mode>.csv`` so an interrupted run can be resumed and the
+raw per-query evidence stays available for the write-up.
+"""
+
+from __future__ import annotations
+
 import csv
-from openai import OpenAI
+import json
+import os
+import time
+
 import chromadb
 
-# ================= 1. Configuration =================
-os.environ["DEEPSEEK_API_KEY"] = "sk-307594d3f334466d94ec9088e76d5f96" # 记得填写真实的 Key
-client = OpenAI(
-    api_key=os.environ.get("DEEPSEEK_API_KEY"),
-    base_url="https://api.deepseek.com"
-)
+from config import (DATABASE_DIR, MODEL_DIR, SPIDER_DEV_PATH)
+from sql_sandbox import db_path_for, execute_sql, results_match, estimate_tokens
 
-SPIDER_DEV_PATH = "data/dev.json"
-DATABASE_DIR = "data/database"
+# --------------------------------------------------------------------------
+# 1. Configuration
+# --------------------------------------------------------------------------
+# Choose the configuration to run: LLM_ONLY | LLM_RAG | FIXED_3 |
+#                                 BAYES_LR | BAYES_RF | BAYES_FULL
+ABLATION_MODE = "BAYES_LR"
 
-# ！！！消融实验核心开关 ！！！
-# 请选择你要跑的基线模式: "LLM_ONLY" 或 "LLM_RAG"
-ABLATION_MODE = "LLM_RAG"
-
-# 根据模式自动设置输出的 CSV 文件名
 CSV_OUT_PATH = f"ablation_results_{ABLATION_MODE.lower()}.csv"
 
-# 初始化向量库 (仅在 LLM_RAG 模式下使用)
+# Vector store is only needed by the RAG-based configurations.
 chroma_client = chromadb.PersistentClient(path="./chroma_db")
 eval_collection = chroma_client.get_or_create_collection(name="spider_eval")
 
-# ================= 2. Core Functions =================
+FIELDS = ["Test_ID", "Database", "Question", "Is_Correct", "Error_Log",
+          "P_Wrong", "Action", "Calls"]
 
-def execute_sql(db_path, sql_query):
-    try:
-        conn = sqlite3.connect(db_path)
-        conn.execute("PRAGMA busy_timeout = 3000")
-        cursor = conn.cursor()
-        cursor.execute(sql_query)
-        res = cursor.fetchall()
-        conn.close()
-        return True, res
-    except Exception as e:
-        return False, str(e)
 
-def get_full_schema_llm_only(db_path):
-    """【基线1专用】直接暴力提取目标数据库的所有表结构，无 RAG 过滤"""
+# --------------------------------------------------------------------------
+# 2. Schema sources for the legacy configurations
+# --------------------------------------------------------------------------
+def get_full_schema_llm_only(db_path: str) -> str:
+    """Baseline 1: dump every CREATE TABLE into the prompt (no filtering)."""
+    import sqlite3
     conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
-    tables = cursor.fetchall()
+    cur = conn.cursor()
+    cur.execute("SELECT sql FROM sqlite_master "
+                "WHERE type='table' AND name NOT LIKE 'sqlite_%';")
+    tables = cur.fetchall()
     conn.close()
     return "\n".join([t[0] for t in tables if t[0]])
 
-def retrieve_schema_rag(query, db_id, top_k=3):
-    """【基线2专用】使用向量检索，只提取 Top-K 表结构"""
-    results = eval_collection.query(
-        query_texts=[query], n_results=top_k, where={"db_id": db_id}
-    )
-    if results['documents'] and results['documents'][0]:
-        return "\n".join(results['documents'][0])
+
+def retrieve_schema_rag(query: str, db_id: str, top_k: int = 3) -> str:
+    """Baseline 2: top-k tables from the ChromaDB index."""
+    results = eval_collection.query(query_texts=[query], n_results=top_k,
+                                    where={"db_id": db_id})
+    if results["documents"] and results["documents"][0]:
+        return "\n".join(results["documents"][0])
     return ""
 
-def generate_sql_one_shot(query, db_path, db_id):
-    """
-    消融实验专用 Agent：
-    1. 根据 ABLATION_MODE 决定如何获取 Schema
-    2. 只有 1 次生成机会 (无 max_retries，无错误反思)
-    """
-    if ABLATION_MODE == "LLM_ONLY":
+
+# --------------------------------------------------------------------------
+# 3. One query under the selected configuration
+# --------------------------------------------------------------------------
+def run_legacy_mode(client, mode: str, question: str, db_path: str,
+                    db_id: str) -> dict:
+    """One-shot (LLM_ONLY / LLM_RAG) or fixed-3 self-correction."""
+    if mode == "LLM_ONLY":
         schema = get_full_schema_llm_only(db_path)
-    elif ABLATION_MODE == "LLM_RAG":
-        schema = retrieve_schema_rag(query, db_id)
+    else:
+        schema = retrieve_schema_rag(question, db_id)
 
-    prompt = f"""Convert the user's question into a SQL query.
-    [Schema]: {schema}
-    [Question]: {query}
-    Output ONLY raw SQL. No markdown, no explanations."""
+    sql, _ = client.generate_sql(question, schema, temperature=0.0)
+    calls = 1
+    max_attempts = 3 if mode == "FIXED_3" else 1
+    ok, out = execute_sql(db_path, sql)
+    for _ in range(max_attempts - 1):
+        if ok:
+            break
+        sql, _ = client.repair_sql(question, schema, sql, str(out), temperature=0.0)
+        calls += 1
+        ok, out = execute_sql(db_path, sql)
+    return {"sql": sql, "ok": ok, "rows": out if ok else None,
+            "status": "Success" if ok else str(out)[:200],
+            "p_wrong": "", "action": "EXECUTE", "calls": calls}
 
-    messages = [
-        {"role": "system", "content": "You are a highly accurate Text-to-SQL assistant."},
-        {"role": "user", "content": prompt}
-    ]
 
-    try:
-        response = client.chat.completions.create(
-            model="deepseek-chat", messages=messages, temperature=0.0
-        )
-        gen_sql = response.choices[0].message.content.strip().replace("```sql", "").replace("```", "").strip()
-        success, exec_res = execute_sql(db_path, gen_sql)
+def run_bayes_mode(agent, question: str, db_path: str, db_id: str,
+                   gold_rows) -> dict:
+    res = agent.run(question, db_id, db_path, gold_rows=gold_rows)
+    return {"sql": res.final_sql, "ok": res.executed_ok, "rows": None,
+            "status": res.status, "p_wrong": round(res.p_wrong_initial, 4),
+            "action": " -> ".join(res.action_path), "calls": res.n_calls,
+            "is_correct": res.is_correct}
 
-        status = "Success" if success else exec_res
-        return gen_sql, exec_res if success else [], status
-    except Exception as e:
-        return None, [], f"API Error: {str(e)}"
 
-# ================= 3. Evaluation Pipeline =================
+# --------------------------------------------------------------------------
+# 4. Driver
+# --------------------------------------------------------------------------
+def build_agent(mode: str):
+    from llm_client import DeepSeekClient
+    from bayesian_agent import BayesianNL2SQLAgent
+    from error_classifier import SQLErrorClassifier
 
-def run_ablation(limit=None):
-    with open(SPIDER_DEV_PATH, 'r', encoding='utf-8') as f:
-        dev_data = json.load(f)
-    if limit: dev_data = dev_data[:limit]
+    model_key = "RF" if mode == "BAYES_RF" else "LR"
+    models = SQLErrorClassifier.load(MODEL_DIR)
+    if model_key not in models:
+        raise SystemExit(f"No {model_key} model in {MODEL_DIR}; "
+                         f"run error_classifier.py first.")
+    return BayesianNL2SQLAgent(
+        client=DeepSeekClient(), classifier=models, model_key=model_key,
+        enable_consistency=(mode == "BAYES_FULL"),
+    )
+
+
+def run_ablation(limit: int | None = None) -> None:
+    with open(SPIDER_DEV_PATH, encoding="utf-8") as fh:
+        dev_data = json.load(fh)
+    if limit:
+        dev_data = dev_data[:limit]
+
+    is_bayes = ABLATION_MODE.startswith("BAYES")
+    if is_bayes:
+        agent = build_agent(ABLATION_MODE)
+        client = None
+    else:
+        from llm_client import DeepSeekClient
+        client = DeepSeekClient()
+        agent = None
 
     total = len(dev_data)
-    correct_count = 0
+    correct = 0
+    calls_total = 0
+    t0 = time.time()
 
     file_exists = os.path.isfile(CSV_OUT_PATH)
-    with open(CSV_OUT_PATH, mode='a', newline='', encoding='utf-8') as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=['Test_ID', 'Database', 'Question', 'Is_Correct', 'Error_Log'])
-        if not file_exists: writer.writeheader()
+    with open(CSV_OUT_PATH, mode="a", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=FIELDS)
+        if not file_exists:
+            writer.writeheader()
 
-        print(f"\n🚀 启动消融实验: 模式 [{ABLATION_MODE}]")
-        print(f"📁 结果将保存至: {CSV_OUT_PATH}\n")
+        print(f"\nAblation run: mode [{ABLATION_MODE}], {total} queries")
+        print(f"Results -> {CSV_OUT_PATH}\n")
 
         for i, item in enumerate(dev_data):
-            db_id = item['db_id']
-            question = item['question']
-            gold_sql = item['query']
-            db_path = os.path.join(DATABASE_DIR, db_id, f"{db_id}.sqlite")
+            db_id, question, gold_sql = item["db_id"], item["question"], item["query"]
+            db_path = db_path_for(db_id, DATABASE_DIR)
+            gold_ok, gold_rows = execute_sql(db_path, gold_sql)
 
-            # Gold execution
-            gold_success, gold_res = execute_sql(db_path, gold_sql)
+            if is_bayes:
+                out = run_bayes_mode(agent, question, db_path, db_id, gold_rows)
+                is_correct = bool(out["is_correct"])
+            else:
+                out = run_legacy_mode(client, ABLATION_MODE, question, db_path, db_id)
+                is_correct = bool(gold_ok and out["ok"]
+                                  and results_match(gold_rows, out["rows"]))
+                out["is_correct"] = is_correct
 
-            # AI execution (One-shot, no correction)
-            gen_sql, gen_res, status_msg = generate_sql_one_shot(question, db_path, db_id)
-
-            is_correct = False
-            error_log = status_msg
-
-            if gold_success and gen_sql:
-                try:
-                    if sorted(gold_res) == sorted(gen_res):
-                        is_correct = True
-                        correct_count += 1
-                        error_log = "Matched"
-                except TypeError:
-                    error_log = "Type/Order Mismatch"
+            calls_total += out["calls"]
+            if is_correct:
+                correct += 1
 
             writer.writerow({
-                'Test_ID': i + 1, 'Database': db_id, 'Question': question,
-                'Is_Correct': is_correct, 'Error_Log': error_log
+                "Test_ID": i + 1, "Database": db_id, "Question": question,
+                "Is_Correct": is_correct,
+                "Error_Log": out["status"] if not is_correct else "Matched",
+                "P_Wrong": out["p_wrong"], "Action": out["action"],
+                "Calls": out["calls"],
             })
             csv_file.flush()
 
-            # 简单进度打印
-            if (i+1) % 50 == 0 or (i+1) == total:
-                print(f"进度: {i+1}/{total} | 当前准确率: {(correct_count/(i+1))*100:.2f}%")
+            if (i + 1) % 50 == 0 or (i + 1) == total:
+                ex = correct / (i + 1) * 100
+                print(f"  {i + 1}/{total} | EX so far {ex:.2f}% | "
+                      f"calls/query {calls_total / (i + 1):.2f}")
 
-    accuracy = (correct_count / total) * 100
-    print("\n" + "="*50)
-    print(f"🏆 消融实验 [{ABLATION_MODE}] 跑分完成!")
-    print(f"📊 最终准确率: {accuracy:.2f}% ({correct_count}/{total})")
-    print("="*50)
+    ex = correct / total * 100
+    print("\n" + "=" * 52)
+    print(f"Ablation [{ABLATION_MODE}] finished")
+    print(f"Execution Accuracy : {ex:.2f}% ({correct}/{total})")
+    print(f"Calls per query    : {calls_total / max(total, 1):.3f}")
+    print(f"Wall clock         : {time.time() - t0:.0f}s")
+    print("=" * 52)
+
 
 if __name__ == "__main__":
-    # 正式跑全量请设为 limit=None
+    # Set limit=10 for a smoke test, None for the full 1034 queries.
     run_ablation(limit=None)
